@@ -1,0 +1,320 @@
+{
+  "name": "Invoice PDF to Accounting — confidence gate + review queue",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "1925e4d3-f4fe-4723-be38-e732e13796cd",
+      "name": "Invoice Email Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [-460, 0],
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "simple": false,
+        "filters": { "q": "has:attachment", "readStatus": "unread" },
+        "options": { "downloadAttachments": true, "dataPropertyAttachmentsPrefixName": "attachment_" }
+      },
+      "credentials": { "gmailOAuth2": { "name": "Gmail account" } }
+    },
+    {
+      "id": "da388c81-4b14-457e-88aa-991487f4f4f5",
+      "name": "Keep PDFs + Hash",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\nconst out = [];\nconst items = $input.all();\nfor (let i = 0; i < items.length; i++) {\n  const bins = items[i].binary || {};\n  for (const key of Object.keys(bins)) {\n    const b = bins[key];\n    const name = String(b.fileName || key).toLowerCase();\n    const isPdf = String(b.mimeType || '').toLowerCase().includes('pdf') || name.endsWith('.pdf');\n    if (!isPdf) continue; // drop signatures, inline images, non-PDF attachments\n    const buf = await this.helpers.getBinaryDataBuffer(i, key);\n    const sha256 = crypto.createHash('sha256').update(buf).digest('hex');\n    out.push({\n      json: {\n        file_name: b.fileName || key,\n        sha256: sha256,\n        message_id: items[i].json.id || '',\n        sender: ((items[i].json.from || {}).value || [{}])[0].address || '',\n        received_at: items[i].json.date || ''\n      },\n      binary: { data: b }\n    });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "f780dae9-9a17-41ca-9f8b-94515b91f202",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [-20, 0],
+      "parameters": {
+        "operation": "pdf",
+        "options": { "joinPages": true, "keepSource": "both" }
+      }
+    },
+    {
+      "id": "4e0d0aa3-f740-45d9-ae87-5738f181d693",
+      "name": "Extract Invoice Fields",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [200, 0],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Extract the invoice data from this supplier invoice text. Rules:\n- Transcribe values exactly as printed. Never guess or infer a value that is not clearly readable.\n- Dates in YYYY-MM-DD. Amounts as plain numbers without currency symbols.\n- For every field in the confidence object, estimate 0 to 1 how clearly the value appears in the text. If a value is missing or barely legible, set it to null and give it a low confidence.\n\nInvoice text:\n{{ $json.text }}",
+        "hasOutputParser": true
+      }
+    },
+    {
+      "id": "0115d266-1f49-4124-a205-440bb10ae471",
+      "name": "Gemini Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [180, 220],
+      "parameters": { "modelName": "models/gemini-3.1-pro-preview", "options": { "temperature": 0 } },
+      "credentials": { "googlePalmApi": { "name": "Google Gemini account" } }
+    },
+    {
+      "id": "1803f108-3dda-4b2a-abee-f36a3434c27e",
+      "name": "Invoice Schema Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [360, 220],
+      "parameters": {
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{ \"supplier_name\": \"Acme Corp\", \"supplier_tax_id\": \"12-3456789\", \"invoice_number\": \"INV-2026-0001\", \"issue_date\": \"2026-01-15\", \"due_date\": \"2026-02-14\", \"currency\": \"USD\", \"subtotal\": 100.0, \"tax\": 8.5, \"total\": 108.5, \"line_items\": [{ \"description\": \"Consulting\", \"quantity\": 2, \"unit_price\": 50.0, \"amount\": 100.0 }], \"confidence\": { \"supplier_name\": 0.99, \"invoice_number\": 0.98, \"total\": 0.97, \"currency\": 0.99, \"issue_date\": 0.9 } }"
+      }
+    },
+    {
+      "id": "106a8daf-8bd8-4829-8f48-87854b0aef2c",
+      "name": "Load Audit Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [420, 0],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Invoice Automation (tabs: Entries, Review_Queue, Audit_Log)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Audit_Log" }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "2a9b2700-4cc9-46b8-b238-4d382d215f56",
+      "name": "Validate & Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const CONFIG = { amountTolerance: 0.02, minConfidence: 0.85 };\nconst sources = $('Keep PDFs + Hash').all();\nconst extracted = $('Extract Invoice Fields').all();\nconst audit = $('Load Audit Log').all()\n  .map(function (i) { return i.json; })\n  .filter(function (r) { return r && (r.sha256 || r.dedup_key); });\nconst seenHashes = new Set();\nconst seenKeys = new Set();\nfor (const r of audit) {\n  if (String(r.decision) === 'rejected') continue;\n  if (r.sha256) seenHashes.add(String(r.sha256));\n  if (r.dedup_key) seenKeys.add(String(r.dedup_key));\n}\nconst out = [];\nfor (let i = 0; i < extracted.length; i++) {\n  const raw = extracted[i].json;\n  const inv = raw.output || raw;\n  const src = sources[i] || { json: {} };\n  const lines = Array.isArray(inv.line_items) ? inv.line_items : [];\n  const lineSum = lines.reduce(function (s, l) { return s + (Number(l.amount) || 0); }, 0);\n  const arithmeticOk = Math.abs(lineSum + (Number(inv.tax) || 0) - (Number(inv.total) || 0)) <= CONFIG.amountTolerance;\n  const conf = inv.confidence || {};\n  const critical = ['supplier_name', 'invoice_number', 'total', 'currency'];\n  let minConf = 1;\n  for (const k of critical) {\n    const c = Number(conf[k]);\n    minConf = Math.min(minConf, isNaN(c) ? 0 : c);\n  }\n  const dedupKey = [\n    String(inv.supplier_name || '').toLowerCase().trim(),\n    String(inv.invoice_number || '').trim(),\n    (Number(inv.total) || 0).toFixed(2)\n  ].join('|');\n  const hash = String(src.json.sha256 || '');\n  let decision;\n  let reason;\n  if (hash && seenHashes.has(hash)) { decision = 'duplicate'; reason = 'exact file hash already processed'; }\n  else if (seenKeys.has(dedupKey)) { decision = 'duplicate'; reason = 'supplier + invoice number + total already processed'; }\n  else if (!arithmeticOk) { decision = 'rejected'; reason = 'line items (' + lineSum.toFixed(2) + ') + tax (' + (Number(inv.tax) || 0).toFixed(2) + ') does not equal total (' + (Number(inv.total) || 0).toFixed(2) + ')'; }\n  else if (minConf < CONFIG.minConfidence) { decision = 'review'; reason = 'low confidence on a critical field: ' + minConf.toFixed(2); }\n  else { decision = 'posted'; reason = 'all checks passed'; }\n  if (hash) seenHashes.add(hash); // idempotency inside the same run too\n  seenKeys.add(dedupKey);\n  const supplierSlug = String(inv.supplier_name || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');\n  out.push({\n    json: {\n      supplier_name: inv.supplier_name || null,\n      supplier_tax_id: inv.supplier_tax_id || null,\n      invoice_number: inv.invoice_number || null,\n      issue_date: inv.issue_date || null,\n      due_date: inv.due_date || null,\n      currency: inv.currency || null,\n      subtotal: inv.subtotal,\n      tax: inv.tax,\n      total: inv.total,\n      line_items: JSON.stringify(lines),\n      confidence_min: Number(minConf.toFixed(2)),\n      sha256: hash,\n      dedup_key: dedupKey,\n      file_name: src.json.file_name || '',\n      received_at: src.json.received_at || '',\n      decision: decision,\n      reason: reason,\n      destination: decision === 'posted' ? 'Entries' : (decision === 'review' ? 'Review_Queue' : 'none'),\n      archive_name: String(inv.issue_date || 'nodate') + '_' + supplierSlug + '_' + String(inv.invoice_number || 'nonumber') + '.pdf',\n      processed_at: new Date().toISOString()\n    },\n    binary: src.binary\n  });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "61b94a7b-b387-47be-b8de-088231a7a260",
+      "name": "Route Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [880, 0],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "renameOutput": true,
+              "outputKey": "posted",
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [{ "leftValue": "={{ $json.decision }}", "operator": { "type": "string", "operation": "equals" }, "rightValue": "posted" }],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "review",
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [{ "leftValue": "={{ $json.decision }}", "operator": { "type": "string", "operation": "equals" }, "rightValue": "review" }],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "duplicate / rejected" }
+      }
+    },
+    {
+      "id": "016d0994-4116-4558-a7e3-35800ff45071",
+      "name": "Archive PDF to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [1120, -160],
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "inputDataFieldName": "data",
+        "name": "={{ $json.archive_name }}",
+        "driveId": { "__rl": true, "mode": "list", "value": "My Drive" },
+        "folderId": { "__rl": true, "mode": "list", "value": "root", "cachedResultName": "/ (Root folder)" }
+      },
+      "credentials": { "googleDriveOAuth2Api": { "name": "Google Drive account" } }
+    },
+    {
+      "id": "b1af26cc-2eea-490c-aff7-2e9ab1dc5c4c",
+      "name": "Append Accounting Entry",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [1340, -160],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Invoice Automation (tabs: Entries, Review_Queue, Audit_Log)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Entries" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "supplier_name": "={{ $('Validate & Decide').item.json.supplier_name }}",
+            "supplier_tax_id": "={{ $('Validate & Decide').item.json.supplier_tax_id }}",
+            "invoice_number": "={{ $('Validate & Decide').item.json.invoice_number }}",
+            "issue_date": "={{ $('Validate & Decide').item.json.issue_date }}",
+            "due_date": "={{ $('Validate & Decide').item.json.due_date }}",
+            "currency": "={{ $('Validate & Decide').item.json.currency }}",
+            "subtotal": "={{ $('Validate & Decide').item.json.subtotal }}",
+            "tax": "={{ $('Validate & Decide').item.json.tax }}",
+            "total": "={{ $('Validate & Decide').item.json.total }}",
+            "line_items": "={{ $('Validate & Decide').item.json.line_items }}",
+            "file_name": "={{ $('Validate & Decide').item.json.file_name }}",
+            "sha256": "={{ $('Validate & Decide').item.json.sha256 }}",
+            "posted_at": "={{ $('Validate & Decide').item.json.processed_at }}"
+          },
+          "schema": [
+            { "id": "supplier_name", "displayName": "supplier_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "supplier_tax_id", "displayName": "supplier_tax_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "invoice_number", "displayName": "invoice_number", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "issue_date", "displayName": "issue_date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "due_date", "displayName": "due_date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "currency", "displayName": "currency", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "subtotal", "displayName": "subtotal", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "tax", "displayName": "tax", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "total", "displayName": "total", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "line_items", "displayName": "line_items", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "file_name", "displayName": "file_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "sha256", "displayName": "sha256", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "posted_at", "displayName": "posted_at", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "7eeacf65-1e99-4259-91a4-5df456e24c9f",
+      "name": "Append Review Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [1120, 60],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Invoice Automation (tabs: Entries, Review_Queue, Audit_Log)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Review_Queue" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "file_name": "={{ $('Validate & Decide').item.json.file_name }}",
+            "supplier_name": "={{ $('Validate & Decide').item.json.supplier_name }}",
+            "invoice_number": "={{ $('Validate & Decide').item.json.invoice_number }}",
+            "total": "={{ $('Validate & Decide').item.json.total }}",
+            "currency": "={{ $('Validate & Decide').item.json.currency }}",
+            "confidence_min": "={{ $('Validate & Decide').item.json.confidence_min }}",
+            "reason": "={{ $('Validate & Decide').item.json.reason }}",
+            "sha256": "={{ $('Validate & Decide').item.json.sha256 }}",
+            "received_at": "={{ $('Validate & Decide').item.json.received_at }}"
+          },
+          "schema": [
+            { "id": "file_name", "displayName": "file_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "supplier_name", "displayName": "supplier_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "invoice_number", "displayName": "invoice_number", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "total", "displayName": "total", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "currency", "displayName": "currency", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "confidence_min", "displayName": "confidence_min", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reason", "displayName": "reason", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "sha256", "displayName": "sha256", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "received_at", "displayName": "received_at", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "39671a93-8b30-4330-8e24-f958699a433d",
+      "name": "Append Audit Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [1560, 0],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Invoice Automation (tabs: Entries, Review_Queue, Audit_Log)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Audit_Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "processed_at": "={{ $('Validate & Decide').item.json.processed_at }}",
+            "file_name": "={{ $('Validate & Decide').item.json.file_name }}",
+            "supplier_name": "={{ $('Validate & Decide').item.json.supplier_name }}",
+            "invoice_number": "={{ $('Validate & Decide').item.json.invoice_number }}",
+            "total": "={{ $('Validate & Decide').item.json.total }}",
+            "currency": "={{ $('Validate & Decide').item.json.currency }}",
+            "decision": "={{ $('Validate & Decide').item.json.decision }}",
+            "reason": "={{ $('Validate & Decide').item.json.reason }}",
+            "confidence_min": "={{ $('Validate & Decide').item.json.confidence_min }}",
+            "destination": "={{ $('Validate & Decide').item.json.destination }}",
+            "sha256": "={{ $('Validate & Decide').item.json.sha256 }}",
+            "dedup_key": "={{ $('Validate & Decide').item.json.dedup_key }}"
+          },
+          "schema": [
+            { "id": "processed_at", "displayName": "processed_at", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "file_name", "displayName": "file_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "supplier_name", "displayName": "supplier_name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "invoice_number", "displayName": "invoice_number", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "total", "displayName": "total", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "currency", "displayName": "currency", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "decision", "displayName": "decision", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reason", "displayName": "reason", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "confidence_min", "displayName": "confidence_min", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "destination", "displayName": "destination", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "sha256", "displayName": "sha256", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "dedup_key", "displayName": "dedup_key", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "4a225ea7-7e93-43ed-8219-1483538bcf62",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [590, -50],
+      "parameters": {
+        "content": "## Money data is treated like money data\n\nArithmetic must balance (lines + tax = total), every critical field needs confidence >= 0.85, and dedup runs on SHA-256 AND supplier+number+total. Anything dubious goes to Review_Queue, never into the books. Every invoice leaves a row in Audit_Log.",
+        "color": 4,
+        "width": 540,
+        "height": 200
+      }
+    }
+  ],
+  "connections": {
+    "Invoice Email Trigger": { "main": [[{ "node": "Keep PDFs + Hash", "type": "main", "index": 0 }]] },
+    "Keep PDFs + Hash": { "main": [[{ "node": "Extract PDF Text", "type": "main", "index": 0 }]] },
+    "Extract PDF Text": { "main": [[{ "node": "Extract Invoice Fields", "type": "main", "index": 0 }]] },
+    "Extract Invoice Fields": { "main": [[{ "node": "Load Audit Log", "type": "main", "index": 0 }]] },
+    "Gemini Model": { "ai_languageModel": [[{ "node": "Extract Invoice Fields", "type": "ai_languageModel", "index": 0 }]] },
+    "Invoice Schema Parser": { "ai_outputParser": [[{ "node": "Extract Invoice Fields", "type": "ai_outputParser", "index": 0 }]] },
+    "Load Audit Log": { "main": [[{ "node": "Validate & Decide", "type": "main", "index": 0 }]] },
+    "Validate & Decide": { "main": [[{ "node": "Route Decision", "type": "main", "index": 0 }]] },
+    "Route Decision": { "main": [
+      [{ "node": "Archive PDF to Drive", "type": "main", "index": 0 }],
+      [{ "node": "Append Review Queue", "type": "main", "index": 0 }],
+      [{ "node": "Append Audit Log", "type": "main", "index": 0 }]
+    ] },
+    "Archive PDF to Drive": { "main": [[{ "node": "Append Accounting Entry", "type": "main", "index": 0 }]] },
+    "Append Accounting Entry": { "main": [[{ "node": "Append Audit Log", "type": "main", "index": 0 }]] },
+    "Append Review Queue": { "main": [[{ "node": "Append Audit Log", "type": "main", "index": 0 }]] }
+  }
+}
