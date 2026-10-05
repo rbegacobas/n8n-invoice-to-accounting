@@ -23,12 +23,44 @@ SUPPLIERS = [("Northwind Supplies LLC", "US-82-1194837"),
              ("Blue Harbor Freight", "US-33-5519002")]
 
 
-def draw(path, number, supplier, taxid, lines, subtotal, tax, total, skew=False):
+def draw_scanned(path, number, supplier, taxid, lines, subtotal, tax, total):
+    """Rasterized 'scan': image-only PDF with NO text layer, so plain text
+    extraction returns nothing and the flow must route it to human review."""
+    import os
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    img = Image.new("L", (1240, 1754), 255)          # A4 @150dpi, grayscale
+    d = ImageDraw.Draw(img)
+    font = ImageFont.load_default(28)
+    bold = ImageFont.load_default(36)
+    y = 120
+    d.text((100, y), "INVOICE", font=bold, fill=90); y += 70
+    d.text((100, y), f"{supplier}   Tax ID: {taxid}", font=font, fill=110); y += 40
+    d.text((100, y), f"Invoice #: {number}", font=font, fill=110); y += 40
+    d.text((100, y), "Issue: 2026-01-15    Due: 2026-02-14    Currency: USD", font=font, fill=110); y += 60
+    d.text((100, y), "Description", font=font, fill=110)
+    d.text((700, y), "Amount", font=font, fill=110)
+    for desc, amt in lines:
+        y += 36
+        d.text((100, y), desc, font=font, fill=115)
+        d.text((700, y), f"{amt:.2f}", font=font, fill=115)
+    y += 60
+    d.text((520, y), f"Subtotal: {subtotal:.2f}", font=font, fill=115); y += 36
+    d.text((520, y), f"Tax (10%): {tax:.2f}", font=font, fill=115); y += 36
+    d.text((520, y), f"Total: {total:.2f}", font=bold, fill=100)
+    img = img.rotate(4, expand=True, fillcolor=255)
+    img = img.filter(ImageFilter.GaussianBlur(1.6))
+    tmp = path + ".jpg"
+    img.convert("RGB").save(tmp, quality=55)
     c = canvas.Canvas(path, pagesize=A4)
-    if skew:                       # simulate a crooked, faint scan -> low confidence
-        c.translate(60, 40)
-        c.rotate(4)
-        c.setFillGray(0.45)
+    c.drawImage(tmp, 0, 0, width=W, height=H)
+    c.save()
+    os.remove(tmp)
+
+
+def draw(path, number, supplier, taxid, lines, subtotal, tax, total, skew=False):
+    if skew:
+        return draw_scanned(path, number, supplier, taxid, lines, subtotal, tax, total)
+    c = canvas.Canvas(path, pagesize=A4)
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, H - 70, "INVOICE")
     c.setFont("Helvetica", 10)
